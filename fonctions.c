@@ -33,19 +33,9 @@ long long expositionModulaire(long long base, long long exposant, long long modu
 
 // Fonction pour générer n et phi(n)
 void genererParametres(int* n, int* phi){
-    // Liste de nombres premiers plus grands pour gérer tous les caractères UTF-8 (0-255)
-    int premiers[] = {151, 157, 163, 167, 173, 179, 181, 191, 193, 197, 199, 211, 223, 227, 229, 233, 239, 241, 251, 257};
-    int tailleListe = sizeof(premiers) / sizeof(premiers[0]);
-    
-    // Choisir deux nombres premiers différents aléatoirement
-    int index1 = rand() % tailleListe;
-    int index2 = rand() % tailleListe;
-    while (index1 == index2){
-        index2 = rand() % tailleListe;
-    }
-    
-    int p = premiers[index1];
-    int q = premiers[index2];
+    // Utiliser des nombres premiers fixes
+    int p = 151;
+    int q = 157;
     
     *n = p * q;
     *phi = calculerPhi(p, q);
