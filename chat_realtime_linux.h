@@ -9,8 +9,16 @@
 #include <termios.h>
 #include <sys/select.h>
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <errno.h>
 #include "fonctions.h"
 #include "aes.h"
+
+#define PORT_CHAT 8888
+#define BUFFER_SIZE 4096
 
 // Structure pour un message en temps réel
 typedef struct {
@@ -33,6 +41,10 @@ typedef struct {
     int sessionActive;
     int messagesEnvoyes;
     int messagesRecus;
+    int socketServeur;
+    int socketClient;
+    int estServeur;
+    pthread_t threadReception;
 } SessionChat;
 
 // Couleurs ANSI pour Linux
@@ -73,6 +85,65 @@ int kbhit() {
     return 0;
 }
 
+// Thread pour recevoir les messages en continu
+void* threadReceptionMessages(void* param) {
+    SessionChat* session = (SessionChat*)param;
+    char buffer[BUFFER_SIZE];
+    
+    while (session->sessionActive) {
+        int bytesRecus = recv(session->socketClient, buffer, BUFFER_SIZE - 1, 0);
+        
+        if (bytesRecus > 0) {
+            buffer[bytesRecus] = '\0';
+            
+            // Parser le message (format: EXPEDITEUR|MESSAGE_CHIFFRE)
+            char* separateur = strchr(buffer, '|');
+            if (separateur != NULL) {
+                *separateur = '\0';
+                char* expediteur = buffer;
+                char* messageChiffre = separateur + 1;
+                
+                // Déchiffrer le message
+                char messageClair[1024];
+                dechiffrerMessageAES(messageChiffre, session->cleAESSession, messageClair);
+                
+                printf("\n");
+                setColor(ANSI_COLOR_MAGENTA);
+                printf("[%s] ", expediteur);
+                setColor(ANSI_COLOR_RESET);
+                printf("%s\n", messageClair);
+                setColor(ANSI_COLOR_CYAN);
+                printf("       -> Dechiffre AES-256 depuis %s\n", session->ipDistante);
+                setColor(ANSI_COLOR_RESET);
+                printf("\n> ");
+                fflush(stdout);
+                
+                session->messagesRecus++;
+            }
+        } else if (bytesRecus == 0) {
+            printf("\n");
+            setColor(ANSI_COLOR_RED);
+            printf("[SYSTEME] Connexion fermee par le correspondant\n");
+            setColor(ANSI_COLOR_RESET);
+            session->sessionActive = 0;
+            break;
+        } else {
+            if (errno != EWOULDBLOCK && errno != EAGAIN) {
+                printf("\n");
+                setColor(ANSI_COLOR_RED);
+                printf("[ERREUR] Erreur de reception: %d\n", errno);
+                setColor(ANSI_COLOR_RESET);
+                session->sessionActive = 0;
+                break;
+            }
+        }
+        
+        usleep(100000); // 100ms
+    }
+    
+    return NULL;
+}
+
 // Initialiser une session de chat
 void initialiserSession(SessionChat* session, const char* nom, const char* ip, int n, int e, long long d) {
     strcpy(session->nomUtilisateur, nom);
@@ -83,6 +154,9 @@ void initialiserSession(SessionChat* session, const char* nom, const char* ip, i
     session->sessionActive = 1;
     session->messagesEnvoyes = 0;
     session->messagesRecus = 0;
+    session->socketServeur = -1;
+    session->socketClient = -1;
+    session->estServeur = 0;
     
     // Générer une clé AES pour cette session
     genererCleAES(session->cleAESSession, AES_KEY_SIZE);
@@ -149,32 +223,130 @@ void dechiffrerMessageAES(const char* messageChiffre, const uint8_t* cleAES, cha
     messageClair[len] = '\0';
 }
 
-// Envoyer un message en temps réel via ping
+// Démarrer le serveur TCP
+int demarrerServeur(SessionChat* session) {
+    struct sockaddr_in adresseServeur, adresseClient;
+    socklen_t tailleAdresse = sizeof(adresseClient);
+    
+    // Créer le socket serveur
+    session->socketServeur = socket(AF_INET, SOCK_STREAM, 0);
+    if (session->socketServeur < 0) {
+        printf("[ERREUR] Impossible de creer le socket: %d\n", errno);
+        return 0;
+    }
+    
+    // Permettre la réutilisation de l'adresse
+    int opt = 1;
+    setsockopt(session->socketServeur, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    // Configurer l'adresse
+    adresseServeur.sin_family = AF_INET;
+    adresseServeur.sin_addr.s_addr = INADDR_ANY;
+    adresseServeur.sin_port = htons(PORT_CHAT);
+    
+    // Bind
+    if (bind(session->socketServeur, (struct sockaddr*)&adresseServeur, sizeof(adresseServeur)) < 0) {
+        printf("[ERREUR] Bind a echoue: %d\n", errno);
+        close(session->socketServeur);
+        return 0;
+    }
+    
+    // Listen
+    if (listen(session->socketServeur, 1) < 0) {
+        printf("[ERREUR] Listen a echoue: %d\n", errno);
+        close(session->socketServeur);
+        return 0;
+    }
+    
+    setColor(ANSI_COLOR_GREEN);
+    printf("\n[SERVEUR] En ecoute sur le port %d...\n", PORT_CHAT);
+    printf("[SERVEUR] En attente de connexion...\n");
+    setColor(ANSI_COLOR_RESET);
+    
+    // Accepter une connexion
+    session->socketClient = accept(session->socketServeur, (struct sockaddr*)&adresseClient, &tailleAdresse);
+    if (session->socketClient < 0) {
+        printf("[ERREUR] Accept a echoue: %d\n", errno);
+        close(session->socketServeur);
+        return 0;
+    }
+    
+    // Récupérer l'IP du client
+    char ipClient[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(adresseClient.sin_addr), ipClient, INET_ADDRSTRLEN);
+    strcpy(session->ipDistante, ipClient);
+    
+    setColor(ANSI_COLOR_GREEN);
+    printf("\n[SERVEUR] Connexion etablie avec %s\n", ipClient);
+    setColor(ANSI_COLOR_RESET);
+    
+    session->estServeur = 1;
+    return 1;
+}
+
+// Se connecter en tant que client
+int connecterClient(SessionChat* session) {
+    struct sockaddr_in adresseServeur;
+    
+    // Créer le socket client
+    session->socketClient = socket(AF_INET, SOCK_STREAM, 0);
+    if (session->socketClient < 0) {
+        printf("[ERREUR] Impossible de creer le socket: %d\n", errno);
+        return 0;
+    }
+    
+    // Configurer l'adresse du serveur
+    adresseServeur.sin_family = AF_INET;
+    adresseServeur.sin_port = htons(PORT_CHAT);
+    inet_pton(AF_INET, session->ipDistante, &adresseServeur.sin_addr);
+    
+    setColor(ANSI_COLOR_CYAN);
+    printf("\n[CLIENT] Connexion a %s:%d...\n", session->ipDistante, PORT_CHAT);
+    setColor(ANSI_COLOR_RESET);
+    
+    // Se connecter
+    if (connect(session->socketClient, (struct sockaddr*)&adresseServeur, sizeof(adresseServeur)) < 0) {
+        printf("[ERREUR] Connexion echouee: %d\n", errno);
+        printf("[INFO] Assurez-vous que l'autre machine est en mode serveur\n");
+        close(session->socketClient);
+        session->socketClient = -1;
+        return 0;
+    }
+    
+    setColor(ANSI_COLOR_GREEN);
+    printf("\n[CLIENT] Connecte a %s:%d\n", session->ipDistante, PORT_CHAT);
+    setColor(ANSI_COLOR_RESET);
+    
+    return 1;
+}
+
+// Envoyer un message en temps réel via TCP
 int envoyerMessageTempsReel(SessionChat* session, const char* message) {
+    if (session->socketClient < 0) {
+        setColor(ANSI_COLOR_RED);
+        printf("[ERREUR] Pas de connexion active\n");
+        setColor(ANSI_COLOR_RESET);
+        return 0;
+    }
+    
     char messageChiffre[2048];
     
     // Chiffrer avec AES
     chiffrerMessageAES(message, session->cleAESSession, messageChiffre);
     
-    // Sauvegarder le message
-    FILE* f = fopen("chat_session.dat", "ab");
-    if (f) {
-        MessageTempsReel msg;
-        strcpy(msg.expediteur, session->nomUtilisateur);
-        strcpy(msg.message, messageChiffre);
-        memcpy(msg.cleAES, session->cleAESSession, AES_KEY_SIZE);
-        msg.timestamp = time(NULL);
-        msg.isChiffre = 1;
-        strcpy(msg.ipDestinataire, session->ipDistante);
-        
-        fwrite(&msg, sizeof(MessageTempsReel), 1, f);
-        fclose(f);
-    }
+    // Préparer le paquet: EXPEDITEUR|MESSAGE_CHIFFRE
+    char paquet[BUFFER_SIZE];
+    snprintf(paquet, BUFFER_SIZE, "%s|%s", session->nomUtilisateur, messageChiffre);
     
-    // Simuler l'envoi via ping (Linux)
-    char commande[512];
-    sprintf(commande, "ping -c 1 -W 1 %s >/dev/null 2>&1", session->ipDistante);
-    system(commande);
+    // Envoyer via socket TCP
+    int byteEnvoyes = send(session->socketClient, paquet, strlen(paquet), 0);
+    
+    if (byteEnvoyes < 0) {
+        setColor(ANSI_COLOR_RED);
+        printf("[ERREUR] Echec d'envoi: %d\n", errno);
+        setColor(ANSI_COLOR_RESET);
+        return 0;
+    }
     
     session->messagesEnvoyes++;
     
@@ -183,44 +355,13 @@ int envoyerMessageTempsReel(SessionChat* session, const char* message) {
     setColor(ANSI_COLOR_RESET);
     printf("%s\n", message);
     setColor(ANSI_COLOR_CYAN);
-    printf("       -> Chiffre AES-256 + Envoye via ping mondial\n");
+    printf("       -> Chiffre AES-256 + Envoye via TCP a %s:%d\n", session->ipDistante, PORT_CHAT);
     setColor(ANSI_COLOR_RESET);
     
     return 1;
 }
 
-// Recevoir des messages en temps réel
-int recevoirMessagesTempsReel(SessionChat* session) {
-    FILE* f = fopen("chat_session.dat", "rb");
-    if (!f) return 0;
-    
-    MessageTempsReel msg;
-    int nouveauxMessages = 0;
-    
-    // Lire les nouveaux messages
-    fseek(f, session->messagesRecus * sizeof(MessageTempsReel), SEEK_SET);
-    
-    while (fread(&msg, sizeof(MessageTempsReel), 1, f) == 1) {
-        if (strcmp(msg.expediteur, session->nomUtilisateur) != 0) {
-            char messageClair[1024];
-            dechiffrerMessageAES(msg.message, msg.cleAES, messageClair);
-            
-            setColor(ANSI_COLOR_MAGENTA);
-            printf("\n[%s] ", msg.expediteur);
-            setColor(ANSI_COLOR_RESET);
-            printf("%s\n", messageClair);
-            setColor(ANSI_COLOR_CYAN);
-            printf("       -> Dechiffre AES-256 depuis %s\n", msg.ipDestinataire);
-            setColor(ANSI_COLOR_RESET);
-            
-            nouveauxMessages++;
-        }
-        session->messagesRecus++;
-    }
-    
-    fclose(f);
-    return nouveauxMessages;
-}
+// (Fonction recevoirMessagesTempsReel supprimée - maintenant gérée par le thread)
 
 // Mode chat interactif avec réception automatique (Linux)
 void modeChatTempsReel(int n, int e, long long d) {
@@ -238,69 +379,98 @@ void modeChatTempsReel(int n, int e, long long d) {
     fgets(buffer, sizeof(buffer), stdin);
     buffer[strcspn(buffer, "\n")] = '\0';
     
-    char ipDistante[64];
-    printf("IP du destinataire (mondiale): ");
-    fgets(ipDistante, sizeof(ipDistante), stdin);
-    ipDistante[strcspn(ipDistante, "\n")] = '\0';
+    printf("\nMode de connexion:\n");
+    printf("  1. Serveur (attendre une connexion)\n");
+    printf("  2. Client (se connecter a une IP)\n");
+    printf("Votre choix: ");
+    int modeChoix;
+    scanf("%d", &modeChoix);
+    getchar();
+    
+    char ipDistante[64] = "0.0.0.0";
+    
+    if (modeChoix == 2) {
+        printf("IP du destinataire: ");
+        fgets(ipDistante, sizeof(ipDistante), stdin);
+        ipDistante[strcspn(ipDistante, "\n")] = '\0';
+    }
     
     initialiserSession(&session, buffer, ipDistante, n, e, d);
+    
+    // Établir la connexion
+    int connexionReussie = 0;
+    if (modeChoix == 1) {
+        connexionReussie = demarrerServeur(&session);
+    } else {
+        connexionReussie = connecterClient(&session);
+    }
+    
+    if (!connexionReussie) {
+        setColor(ANSI_COLOR_RED);
+        printf("\n[ERREUR] Impossible d'etablir la connexion\n");
+        setColor(ANSI_COLOR_RESET);
+        return;
+    }
     
     afficherInterfaceChat(&session);
     
     setColor(ANSI_COLOR_GREEN);
     printf("OK Session initialisee avec chiffrement AES-256\n");
-    printf("OK Communication mondiale via ping activee\n");
-    printf("OK Cle de session generee: ");
+    printf("OK Communication TCP/IP en temps reel activee\n");
+    printf("OK Connexion etablie avec %s:%d\n", session.ipDistante, PORT_CHAT);
+    printf("OK Cle de session universelle: ");
     char hexKey[65];
     bytesToHex(session.cleAESSession, AES_KEY_SIZE, hexKey);
     printf("%.16s...\n\n", hexKey);
     setColor(ANSI_COLOR_RESET);
     
+    // Démarrer le thread de réception
+    if (pthread_create(&session.threadReception, NULL, threadReceptionMessages, &session) != 0) {
+        printf("[ERREUR] Impossible de creer le thread de reception\n");
+        close(session.socketClient);
+        if (session.estServeur) close(session.socketServeur);
+        return;
+    }
+    
     printf("Tapez vos messages (tapez '/quit' pour quitter, '/refresh' pour actualiser):\n");
     printf("===========================================================================\n\n");
     
-    // Variables pour la saisie non-bloquante
-    time_t dernierCheck = time(NULL);
-    
+    // Boucle principale
     while (session.sessionActive) {
-        // Vérifier les nouveaux messages toutes les 2 secondes
-        time_t maintenant = time(NULL);
-        if (difftime(maintenant, dernierCheck) >= 2.0) {
-            int nouveaux = recevoirMessagesTempsReel(&session);
-            if (nouveaux > 0) {
-                printf("\n> ");
-                fflush(stdout);
-            }
-            dernierCheck = maintenant;
+        printf("> ");
+        if (fgets(buffer, sizeof(buffer), stdin) == NULL) {
+            break;
         }
+        buffer[strcspn(buffer, "\n")] = '\0';
         
-        // Vérifier si une entrée est disponible (Linux)
-        if (kbhit()) {
-            printf("> ");
-            if (fgets(buffer, sizeof(buffer), stdin) == NULL) {
-                break;
-            }
-            buffer[strcspn(buffer, "\n")] = '\0';
-            
-            if (strcmp(buffer, "/quit") == 0) {
-                session.sessionActive = 0;
-                setColor(ANSI_COLOR_RED);
-                printf("\n[SYSTEME] Session terminee. Messages: %d envoyes, %d recus\n",
-                       session.messagesEnvoyes, session.messagesRecus);
-                setColor(ANSI_COLOR_RESET);
-                break;
-            } else if (strcmp(buffer, "/refresh") == 0) {
-                afficherInterfaceChat(&session);
-                printf("===========================================================================\n\n");
-                continue;
-            } else if (strlen(buffer) > 0) {
-                envoyerMessageTempsReel(&session, buffer);
-            }
-        } else {
-            // Petite pause pour ne pas surcharger le CPU
-            usleep(100000); // 100ms
+        if (strcmp(buffer, "/quit") == 0) {
+            session.sessionActive = 0;
+            setColor(ANSI_COLOR_RED);
+            printf("\n[SYSTEME] Session terminee. Messages: %d envoyes, %d recus\n",
+                   session.messagesEnvoyes, session.messagesRecus);
+            setColor(ANSI_COLOR_RESET);
+            break;
+        } else if (strcmp(buffer, "/refresh") == 0) {
+            afficherInterfaceChat(&session);
+            printf("===========================================================================\n\n");
+            continue;
+        } else if (strlen(buffer) > 0) {
+            envoyerMessageTempsReel(&session, buffer);
         }
     }
+    
+    // Nettoyage
+    session.sessionActive = 0;
+    pthread_join(session.threadReception, NULL);
+    
+    close(session.socketClient);
+    if (session.estServeur) {
+        close(session.socketServeur);
+    }
+    
+    setColor(ANSI_COLOR_GREEN);
+    printf("\n[OK] Connexion fermee proprement\n");
+    setColor(ANSI_COLOR_RESET);
 }
 
 #endif

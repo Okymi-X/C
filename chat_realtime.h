@@ -7,8 +7,19 @@
 #include <time.h>
 #include <windows.h>
 #include <conio.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include "fonctions.h"
 #include "aes.h"
+
+#pragma comment(lib, "ws2_32.lib")
+
+#define PORT_CHAT 8888
+#define BUFFER_SIZE 4096
+
+// Déclarations anticipées
+void chiffrerMessageAES(const char* message, const uint8_t* cleAES, char* messageChiffre);
+void dechiffrerMessageAES(const char* messageChiffre, const uint8_t* cleAES, char* messageClair);
 
 // Structure pour un message en temps réel
 typedef struct {
@@ -31,6 +42,10 @@ typedef struct {
     int sessionActive;
     int messagesEnvoyes;
     int messagesRecus;
+    SOCKET socketServeur;
+    SOCKET socketClient;
+    int estServeur;
+    HANDLE threadReception;
 } SessionChat;
 
 // Couleurs pour le terminal
@@ -46,6 +61,82 @@ void setColor(int color) {
 #define COLOR_RED 12
 #define COLOR_MAGENTA 13
 
+// Initialiser Winsock
+int initialiserWinsock() {
+    WSADATA wsaData;
+    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (result != 0) {
+        printf("[ERREUR] WSAStartup a echoue: %d\n", result);
+        return 0;
+    }
+    return 1;
+}
+
+// Nettoyer Winsock
+void nettoyerWinsock() {
+    WSACleanup();
+}
+
+// Thread pour recevoir les messages en continu
+DWORD WINAPI threadReceptionMessages(LPVOID param) {
+    SessionChat* session = (SessionChat*)param;
+    char buffer[BUFFER_SIZE];
+    
+    while (session->sessionActive) {
+        int bytesRecus = recv(session->socketClient, buffer, BUFFER_SIZE - 1, 0);
+        
+        if (bytesRecus > 0) {
+            buffer[bytesRecus] = '\0';
+            
+            // Parser le message (format: EXPEDITEUR|MESSAGE_CHIFFRE)
+            char* separateur = strchr(buffer, '|');
+            if (separateur != NULL) {
+                *separateur = '\0';
+                char* expediteur = buffer;
+                char* messageChiffre = separateur + 1;
+                
+                // Déchiffrer le message
+                char messageClair[1024];
+                dechiffrerMessageAES(messageChiffre, session->cleAESSession, messageClair);
+                
+                printf("\n");
+                setColor(COLOR_MAGENTA);
+                printf("[%s] ", expediteur);
+                setColor(COLOR_RESET);
+                printf("%s\n", messageClair);
+                setColor(COLOR_CYAN);
+                printf("       -> Dechiffre AES-256 depuis %s\n", session->ipDistante);
+                setColor(COLOR_RESET);
+                printf("\n> ");
+                fflush(stdout);
+                
+                session->messagesRecus++;
+            }
+        } else if (bytesRecus == 0) {
+            printf("\n");
+            setColor(COLOR_RED);
+            printf("[SYSTEME] Connexion fermee par le correspondant\n");
+            setColor(COLOR_RESET);
+            session->sessionActive = 0;
+            break;
+        } else {
+            int erreur = WSAGetLastError();
+            if (erreur != WSAEWOULDBLOCK) {
+                printf("\n");
+                setColor(COLOR_RED);
+                printf("[ERREUR] Erreur de reception: %d\n", erreur);
+                setColor(COLOR_RESET);
+                session->sessionActive = 0;
+                break;
+            }
+        }
+        
+        Sleep(100);
+    }
+    
+    return 0;
+}
+
 // Initialiser une session de chat
 void initialiserSession(SessionChat* session, const char* nom, const char* ip, int n, int e, long long d) {
     strcpy(session->nomUtilisateur, nom);
@@ -56,6 +147,10 @@ void initialiserSession(SessionChat* session, const char* nom, const char* ip, i
     session->sessionActive = 1;
     session->messagesEnvoyes = 0;
     session->messagesRecus = 0;
+    session->socketServeur = INVALID_SOCKET;
+    session->socketClient = INVALID_SOCKET;
+    session->estServeur = 0;
+    session->threadReception = NULL;
     
     // Générer une clé AES pour cette session
     genererCleAES(session->cleAESSession, AES_KEY_SIZE);
@@ -123,32 +218,33 @@ void dechiffrerMessageAES(const char* messageChiffre, const uint8_t* cleAES, cha
     messageClair[len] = '\0';
 }
 
-// Envoyer un message en temps réel via ping
+// Envoyer un message en temps réel via TCP
 int envoyerMessageTempsReel(SessionChat* session, const char* message) {
+    if (session->socketClient == INVALID_SOCKET) {
+        setColor(COLOR_RED);
+        printf("[ERREUR] Pas de connexion active\n");
+        setColor(COLOR_RESET);
+        return 0;
+    }
+    
     char messageChiffre[2048];
     
     // Chiffrer avec AES
     chiffrerMessageAES(message, session->cleAESSession, messageChiffre);
     
-    // Sauvegarder le message
-    FILE* f = fopen("chat_session.dat", "ab");
-    if (f) {
-        MessageTempsReel msg;
-        strcpy(msg.expediteur, session->nomUtilisateur);
-        strcpy(msg.message, messageChiffre);
-        memcpy(msg.cleAES, session->cleAESSession, AES_KEY_SIZE);
-        msg.timestamp = time(NULL);
-        msg.isChiffre = 1;
-        strcpy(msg.ipDestinataire, session->ipDistante);
-        
-        fwrite(&msg, sizeof(MessageTempsReel), 1, f);
-        fclose(f);
-    }
+    // Préparer le paquet: EXPEDITEUR|MESSAGE_CHIFFRE
+    char paquet[BUFFER_SIZE];
+    snprintf(paquet, BUFFER_SIZE, "%s|%s", session->nomUtilisateur, messageChiffre);
     
-    // Simuler l'envoi via ping (en temps réel)
-    char commande[512];
-    sprintf(commande, "ping -n 1 -w 100 %s >nul 2>&1", session->ipDistante);
-    system(commande);
+    // Envoyer via socket TCP
+    int byteEnvoyes = send(session->socketClient, paquet, strlen(paquet), 0);
+    
+    if (byteEnvoyes == SOCKET_ERROR) {
+        setColor(COLOR_RED);
+        printf("[ERREUR] Echec d'envoi: %d\n", WSAGetLastError());
+        setColor(COLOR_RESET);
+        return 0;
+    }
     
     session->messagesEnvoyes++;
     
@@ -157,43 +253,102 @@ int envoyerMessageTempsReel(SessionChat* session, const char* message) {
     setColor(COLOR_RESET);
     printf("%s\n", message);
     setColor(COLOR_CYAN);
-    printf("       -> Chiffre AES-256 + Envoye via ping mondial\n");
+    printf("       -> Chiffre AES-256 + Envoye via TCP a %s:%d\n", session->ipDistante, PORT_CHAT);
     setColor(COLOR_RESET);
     
     return 1;
 }
 
-// Recevoir des messages en temps réel
-int recevoirMessagesTempsReel(SessionChat* session) {
-    FILE* f = fopen("chat_session.dat", "rb");
-    if (!f) return 0;
+// Démarrer le serveur TCP
+int demarrerServeur(SessionChat* session) {
+    struct sockaddr_in adresseServeur, adresseClient;
+    int tailleAdresse = sizeof(adresseClient);
     
-    MessageTempsReel msg;
-    int nouveauxMessages = 0;
-    
-    // Lire les nouveaux messages
-    fseek(f, session->messagesRecus * sizeof(MessageTempsReel), SEEK_SET);
-    
-    while (fread(&msg, sizeof(MessageTempsReel), 1, f) == 1) {
-        if (strcmp(msg.expediteur, session->nomUtilisateur) != 0) {
-            char messageClair[1024];
-            dechiffrerMessageAES(msg.message, msg.cleAES, messageClair);
-            
-            setColor(COLOR_MAGENTA);
-            printf("\n[%s] ", msg.expediteur);
-            setColor(COLOR_RESET);
-            printf("%s\n", messageClair);
-            setColor(COLOR_CYAN);
-            printf("       -> Dechiffre AES-256 depuis %s\n", msg.ipDestinataire);
-            setColor(COLOR_RESET);
-            
-            nouveauxMessages++;
-        }
-        session->messagesRecus++;
+    // Créer le socket serveur
+    session->socketServeur = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (session->socketServeur == INVALID_SOCKET) {
+        printf("[ERREUR] Impossible de creer le socket: %d\n", WSAGetLastError());
+        return 0;
     }
     
-    fclose(f);
-    return nouveauxMessages;
+    // Configurer l'adresse
+    adresseServeur.sin_family = AF_INET;
+    adresseServeur.sin_addr.s_addr = INADDR_ANY;
+    adresseServeur.sin_port = htons(PORT_CHAT);
+    
+    // Bind
+    if (bind(session->socketServeur, (struct sockaddr*)&adresseServeur, sizeof(adresseServeur)) == SOCKET_ERROR) {
+        printf("[ERREUR] Bind a echoue: %d\n", WSAGetLastError());
+        closesocket(session->socketServeur);
+        return 0;
+    }
+    
+    // Listen
+    if (listen(session->socketServeur, 1) == SOCKET_ERROR) {
+        printf("[ERREUR] Listen a echoue: %d\n", WSAGetLastError());
+        closesocket(session->socketServeur);
+        return 0;
+    }
+    
+    setColor(COLOR_GREEN);
+    printf("\n[SERVEUR] En ecoute sur le port %d...\n", PORT_CHAT);
+    printf("[SERVEUR] En attente de connexion...\n");
+    setColor(COLOR_RESET);
+    
+    // Accepter une connexion
+    session->socketClient = accept(session->socketServeur, (struct sockaddr*)&adresseClient, &tailleAdresse);
+    if (session->socketClient == INVALID_SOCKET) {
+        printf("[ERREUR] Accept a echoue: %d\n", WSAGetLastError());
+        closesocket(session->socketServeur);
+        return 0;
+    }
+    
+    // Récupérer l'IP du client
+    char* ipClient = inet_ntoa(adresseClient.sin_addr);
+    strcpy(session->ipDistante, ipClient);
+    
+    setColor(COLOR_GREEN);
+    printf("\n[SERVEUR] Connexion etablie avec %s\n", ipClient);
+    setColor(COLOR_RESET);
+    
+    session->estServeur = 1;
+    return 1;
+}
+
+// Se connecter en tant que client
+int connecterClient(SessionChat* session) {
+    struct sockaddr_in adresseServeur;
+    
+    // Créer le socket client
+    session->socketClient = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (session->socketClient == INVALID_SOCKET) {
+        printf("[ERREUR] Impossible de creer le socket: %d\n", WSAGetLastError());
+        return 0;
+    }
+    
+    // Configurer l'adresse du serveur
+    adresseServeur.sin_family = AF_INET;
+    adresseServeur.sin_port = htons(PORT_CHAT);
+    adresseServeur.sin_addr.s_addr = inet_addr(session->ipDistante);
+    
+    setColor(COLOR_CYAN);
+    printf("\n[CLIENT] Connexion a %s:%d...\n", session->ipDistante, PORT_CHAT);
+    setColor(COLOR_RESET);
+    
+    // Se connecter
+    if (connect(session->socketClient, (struct sockaddr*)&adresseServeur, sizeof(adresseServeur)) == SOCKET_ERROR) {
+        printf("[ERREUR] Connexion echouee: %d\n", WSAGetLastError());
+        printf("[INFO] Assurez-vous que l'autre machine est en mode serveur\n");
+        closesocket(session->socketClient);
+        session->socketClient = INVALID_SOCKET;
+        return 0;
+    }
+    
+    setColor(COLOR_GREEN);
+    printf("\n[CLIENT] Connecte a %s:%d\n", session->ipDistante, PORT_CHAT);
+    setColor(COLOR_RESET);
+    
+    return 1;
 }
 
 // Mode chat interactif avec réception automatique
@@ -202,6 +357,12 @@ void modeChatTempsReel(int n, int e, long long d) {
     char buffer[256];
     
     system("chcp 65001 >nul 2>&1"); // UTF-8
+    
+    // Initialiser Winsock
+    if (!initialiserWinsock()) {
+        printf("[ERREUR] Impossible d'initialiser Winsock\n");
+        return;
+    }
     
     printf("\n");
     setColor(COLOR_YELLOW);
@@ -214,69 +375,105 @@ void modeChatTempsReel(int n, int e, long long d) {
     fgets(buffer, sizeof(buffer), stdin);
     buffer[strcspn(buffer, "\n")] = '\0';
     
-    char ipDistante[64];
-    printf("IP du destinataire (mondiale): ");
-    fgets(ipDistante, sizeof(ipDistante), stdin);
-    ipDistante[strcspn(ipDistante, "\n")] = '\0';
+    printf("\nMode de connexion:\n");
+    printf("  1. Serveur (attendre une connexion)\n");
+    printf("  2. Client (se connecter a une IP)\n");
+    printf("Votre choix: ");
+    int modeChoix;
+    scanf("%d", &modeChoix);
+    getchar();
+    
+    char ipDistante[64] = "0.0.0.0";
+    
+    if (modeChoix == 2) {
+        printf("IP du destinataire: ");
+        fgets(ipDistante, sizeof(ipDistante), stdin);
+        ipDistante[strcspn(ipDistante, "\n")] = '\0';
+    }
     
     initialiserSession(&session, buffer, ipDistante, n, e, d);
+    
+    // Établir la connexion
+    int connexionReussie = 0;
+    if (modeChoix == 1) {
+        connexionReussie = demarrerServeur(&session);
+    } else {
+        connexionReussie = connecterClient(&session);
+    }
+    
+    if (!connexionReussie) {
+        setColor(COLOR_RED);
+        printf("\n[ERREUR] Impossible d'etablir la connexion\n");
+        setColor(COLOR_RESET);
+        nettoyerWinsock();
+        return;
+    }
     
     afficherInterfaceChat(&session);
     
     setColor(COLOR_GREEN);
     printf("OK Session initialisee avec chiffrement AES-256\n");
-    printf("OK Communication mondiale via ping activee\n");
-    printf("OK Cle de session generee: ");
+    printf("OK Communication TCP/IP en temps reel activee\n");
+    printf("OK Connexion etablie avec %s:%d\n", session.ipDistante, PORT_CHAT);
+    printf("OK Cle de session universelle: ");
     char hexKey[65];
     bytesToHex(session.cleAESSession, AES_KEY_SIZE, hexKey);
     printf("%.16s...\n\n", hexKey);
     setColor(COLOR_RESET);
     
+    // Démarrer le thread de réception
+    session.threadReception = CreateThread(NULL, 0, threadReceptionMessages, &session, 0, NULL);
+    if (session.threadReception == NULL) {
+        printf("[ERREUR] Impossible de creer le thread de reception\n");
+        closesocket(session.socketClient);
+        if (session.estServeur) closesocket(session.socketServeur);
+        nettoyerWinsock();
+        return;
+    }
+    
     printf("Tapez vos messages (tapez '/quit' pour quitter, '/refresh' pour actualiser):\n");
     printf("===========================================================================\n\n");
     
-    // Variables pour la saisie non-bloquante
-    time_t dernierCheck = time(NULL);
-    
+    // Boucle principale
     while (session.sessionActive) {
-        // Vérifier les nouveaux messages toutes les 2 secondes
-        time_t maintenant = time(NULL);
-        if (difftime(maintenant, dernierCheck) >= 2.0) {
-            int nouveaux = recevoirMessagesTempsReel(&session);
-            if (nouveaux > 0) {
-                printf("\n> "); // Réafficher le prompt
-                fflush(stdout);
-            }
-            dernierCheck = maintenant;
+        printf("> ");
+        if (fgets(buffer, sizeof(buffer), stdin) == NULL) {
+            break;
         }
+        buffer[strcspn(buffer, "\n")] = '\0';
         
-        // Vérifier si une entrée est disponible (non-bloquant sur Windows)
-        if (_kbhit()) {
-            printf("> ");
-            if (fgets(buffer, sizeof(buffer), stdin) == NULL) {
-                break;
-            }
-            buffer[strcspn(buffer, "\n")] = '\0';
-            
-            if (strcmp(buffer, "/quit") == 0) {
-                session.sessionActive = 0;
-                setColor(COLOR_RED);
-                printf("\n[SYSTEME] Session terminee. Messages: %d envoyes, %d recus\n",
-                       session.messagesEnvoyes, session.messagesRecus);
-                setColor(COLOR_RESET);
-                break;
-            } else if (strcmp(buffer, "/refresh") == 0) {
-                afficherInterfaceChat(&session);
-                printf("===========================================================================\n\n");
-                continue;
-            } else if (strlen(buffer) > 0) {
-                envoyerMessageTempsReel(&session, buffer);
-            }
-        } else {
-            // Petite pause pour ne pas surcharger le CPU
-            Sleep(100);
+        if (strcmp(buffer, "/quit") == 0) {
+            session.sessionActive = 0;
+            setColor(COLOR_RED);
+            printf("\n[SYSTEME] Session terminee. Messages: %d envoyes, %d recus\n",
+                   session.messagesEnvoyes, session.messagesRecus);
+            setColor(COLOR_RESET);
+            break;
+        } else if (strcmp(buffer, "/refresh") == 0) {
+            afficherInterfaceChat(&session);
+            printf("===========================================================================\n\n");
+            continue;
+        } else if (strlen(buffer) > 0) {
+            envoyerMessageTempsReel(&session, buffer);
         }
     }
+    
+    // Nettoyage
+    session.sessionActive = 0;
+    if (session.threadReception != NULL) {
+        WaitForSingleObject(session.threadReception, 2000);
+        CloseHandle(session.threadReception);
+    }
+    
+    closesocket(session.socketClient);
+    if (session.estServeur) {
+        closesocket(session.socketServeur);
+    }
+    nettoyerWinsock();
+    
+    setColor(COLOR_GREEN);
+    printf("\n[OK] Connexion fermee proprement\n");
+    setColor(COLOR_RESET);
 }
 
 #endif

@@ -5,7 +5,7 @@ echo "  COMPILATION MESSAGERIE - LINUX"
 echo "========================================"
 
 # Compilation pour Linux
-gcc -o messagerie_linux main_multiplatform.c fonctions.c -lm -D__linux__
+gcc -o messagerie_linux main_multiplatform.c fonctions.c -lm -lpthread -D__linux__
 
 if [ $? -eq 0 ]; then
     echo ""

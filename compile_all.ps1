@@ -7,7 +7,7 @@ Write-Host ""
 
 # Compilation version Windows
 Write-Host "[1/2] Compilation version Windows..." -ForegroundColor Green
-gcc -o messagerie_windows.exe main_multiplatform.c fonctions.c -lm
+gcc -o messagerie_windows.exe main_multiplatform.c fonctions.c -lm -lws2_32 -lmswsock
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "[OK] Version Windows compilée: messagerie_windows.exe" -ForegroundColor Green
@@ -23,7 +23,7 @@ Write-Host "[2/2] Tentative de compilation Linux (via WSL)..." -ForegroundColor 
 
 if (Get-Command wsl -ErrorAction SilentlyContinue) {
     Write-Host "WSL détecté, compilation Linux..." -ForegroundColor Cyan
-    wsl gcc -o messagerie_linux main_multiplatform.c fonctions.c -lm -D__linux__
+    wsl gcc -o messagerie_linux main_multiplatform.c fonctions.c -lm -lpthread -D__linux__
     
     if ($LASTEXITCODE -eq 0) {
         Write-Host "[OK] Version Linux compilée: messagerie_linux" -ForegroundColor Green
